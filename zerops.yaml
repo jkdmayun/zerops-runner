@@ -1,0 +1,22 @@
+zerops:
+  - setup: app
+
+    build:
+      os: ubuntu
+      base: nodejs@22
+
+      buildCommands:
+        - test -f commands.txt
+
+      deployFiles:
+        - commands.txt
+
+    run:
+      os: ubuntu
+      base: nodejs@22
+
+      prepareCommands:
+        - sudo apt-get update
+        - sudo apt-get install -y --no-install-recommends bash curl ca-certificates git
+
+      start: bash commands.txt
