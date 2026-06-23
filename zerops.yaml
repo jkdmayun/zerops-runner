@@ -17,6 +17,6 @@ zerops:
 
       prepareCommands:
         - sudo apt-get update
-        - sudo apt-get install -y --no-install-recommends bash curl ca-certificates git
+        - sudo apt-get install -y --no-install-recommends bash curl ca-certificates
 
       start: bash /var/www/commands.txt
