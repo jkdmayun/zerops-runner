@@ -9,10 +9,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+    timeout-minutes: 50
 
     steps:
-      - name: Build fully static ARM64 XMRig
+      - name: Build static ARM64 XMRig from official source
         shell: bash
         run: |
           set -euo pipefail
@@ -51,43 +51,66 @@ jobs:
           mkdir -p "$WORK" "$OUT/runtime"
 
           cd "$WORK"
+
           git clone --depth 1 --branch v6.26.0 https://github.com/xmrig/xmrig.git xmrig
+
+          EXPECTED_COMMIT="b2ca72480c58d197e18c885d9fc1a0c8d517e60a"
+          ACTUAL_COMMIT="$(git -C "$SRC" rev-parse HEAD)"
+
+          if [ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]; then
+            echo "Unexpected XMRig source commit: $ACTUAL_COMMIT"
+            exit 1
+          fi
 
           python3 - "$SRC" <<'PY'
           from pathlib import Path
+          import re
           import sys
 
           src = Path(sys.argv[1])
 
-          def fail(message):
-              raise SystemExit(message)
+          cmake_file = src / "CMakeLists.txt"
+          network_cpp = src / "src/net/Network.cpp"
+          donate_h = src / "src/donate.h"
+          donate_cpp = src / "src/net/strategies/DonateStrategy.cpp"
+          donate_header = src / "src/net/strategies/DonateStrategy.h"
 
-          def remove_block(text, marker):
+          def require_single_sub(pattern, repl, text, label, flags=0):
+              new_text, count = re.subn(pattern, repl, text, count=1, flags=flags)
+
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly 1 match, found {count}")
+
+              return new_text
+
+          def remove_cpp_block(text, marker, label):
               start = text.find(marker)
+
               if start < 0:
-                  fail(f"Cannot find block marker: {marker}")
+                  raise SystemExit(f"{label}: marker not found")
 
               brace = text.find("{", start)
+
               if brace < 0:
-                  fail(f"Cannot find opening brace after: {marker}")
+                  raise SystemExit(f"{label}: opening brace not found")
 
               depth = 0
               end = None
 
-              for i in range(brace, len(text)):
-                  ch = text[i]
+              for pos in range(brace, len(text)):
+                  char = text[pos]
 
-                  if ch == "{":
+                  if char == "{":
                       depth += 1
-                  elif ch == "}":
+                  elif char == "}":
                       depth -= 1
 
                       if depth == 0:
-                          end = i + 1
+                          end = pos + 1
                           break
 
               if end is None:
-                  fail(f"Cannot find closing brace after: {marker}")
+                  raise SystemExit(f"{label}: closing brace not found")
 
               while end < len(text) and text[end] in " \t":
                   end += 1
@@ -97,142 +120,43 @@ jobs:
 
               return text[:start] + text[end:]
 
-          def remove_all_blocks(text, marker):
-              while marker in text:
-                  text = remove_block(text, marker)
-
-              return text
-
-          def replace_required(text, old, new, label):
-              count = text.count(old)
-
-              if count != 1:
-                  fail(f"{label}: expected exactly 1 match, found {count}")
-
-              return text.replace(old, new, 1)
-
-          cmake_file = src / "CMakeLists.txt"
-          network_cpp = src / "src/net/Network.cpp"
-          network_h = src / "src/net/Network.h"
-          donate_h = src / "src/donate.h"
-
           cmake = cmake_file.read_text()
 
-          cmake = replace_required(
+          cmake = require_single_sub(
+              r'^[ \t]*src/net/strategies/DonateStrategy\.h[ \t]*\n',
+              '',
               cmake,
-              "    src/net/strategies/DonateStrategy.h\n",
-              "",
-              "Remove DonateStrategy header from CMakeLists.txt"
+              'Remove DonateStrategy.h from CMakeLists.txt',
+              re.MULTILINE
           )
 
-          cmake = replace_required(
+          cmake = require_single_sub(
+              r'^[ \t]*src/net/strategies/DonateStrategy\.cpp[ \t]*\n',
+              '',
               cmake,
-              "    src/net/strategies/DonateStrategy.cpp\n",
-              "",
-              "Remove DonateStrategy source from CMakeLists.txt"
+              'Remove DonateStrategy.cpp from CMakeLists.txt',
+              re.MULTILINE
           )
 
           cmake_file.write_text(cmake)
 
           network = network_cpp.read_text()
 
-          network = replace_required(
+          network = require_single_sub(
+              r'^#include "net/strategies/DonateStrategy\.h"\n',
+              '',
               network,
-              '#include "net/strategies/DonateStrategy.h"\n',
-              "",
-              "Remove DonateStrategy include"
+              'Remove DonateStrategy include',
+              re.MULTILINE
           )
 
-          network = replace_required(
+          network = remove_cpp_block(
               network,
-              """    const Pools &pools = controller->config()->pools();
-
-              m_strategy = pools.createStrategy(m_state);
-
-              """,
-              """    m_strategy = controller->config()->pools().createStrategy(m_state);
-
-              """,
-              "Simplify pool strategy initialization"
-          )
-
-          network = remove_all_blocks(
-              network,
-              "if (pools.donateLevel() > 0)"
-          )
-
-          network = replace_required(
-              network,
-              "    delete m_donate;\n",
-              "",
-              "Remove m_donate destruction"
-          )
-
-          network = remove_all_blocks(
-              network,
-              "if (m_donate && m_donate == strategy)"
-          )
-
-          network = remove_all_blocks(
-              network,
-              "if (m_donate && m_donate->isActive() && m_donate != strategy)"
-          )
-
-          network = replace_required(
-              network,
-              "    setJob(client, job, m_donate == strategy);\n",
-              "    setJob(client, job);\n",
-              "Remove donation job routing"
-          )
-
-          network = remove_all_blocks(
-              network,
-              "if (result.index == 1 && m_donate)"
-          )
-
-          network = remove_all_blocks(
-              network,
-              "if (!donate && m_donate)"
-          )
-
-          network = remove_all_blocks(
-              network,
-              "if (m_donate)"
-          )
-
-          network = replace_required(
-              network,
-              "void xmrig::Network::setJob(IClient *client, const Job &job, bool donate)",
-              "void xmrig::Network::setJob(IClient *client, const Job &job)",
-              "Remove donate parameter from setJob definition"
-          )
-
-          network = replace_required(
-              network,
-              "    m_controller->miner()->setJob(job, donate);\n",
-              "    m_controller->miner()->setJob(job, false);\n",
-              "Force all jobs to normal pool"
+              'if (pools.donateLevel() > 0)',
+              'Remove donation strategy construction block'
           )
 
           network_cpp.write_text(network)
-
-          header = network_h.read_text()
-
-          header = replace_required(
-              header,
-              "    void setJob(IClient *client, const Job &job, bool donate);\n",
-              "    void setJob(IClient *client, const Job &job);\n",
-              "Remove donate parameter from Network.h"
-          )
-
-          header = replace_required(
-              header,
-              "    IStrategy *m_donate = nullptr;\n",
-              "",
-              "Remove m_donate member from Network.h"
-          )
-
-          network_h.write_text(header)
 
           donate_h.write_text(
               """#ifndef XMRIG_DONATE_H
@@ -245,45 +169,37 @@ jobs:
           """
           )
 
-          donate_cpp = src / "src/net/strategies/DonateStrategy.cpp"
-          donate_header = src / "src/net/strategies/DonateStrategy.h"
+          if not donate_cpp.exists():
+              raise SystemExit('DonateStrategy.cpp does not exist before deletion')
 
-          if not donate_cpp.exists() or not donate_header.exists():
-              fail("DonateStrategy source files are missing before removal")
+          if not donate_header.exists():
+              raise SystemExit('DonateStrategy.h does not exist before deletion')
 
           donate_cpp.unlink()
           donate_header.unlink()
 
-          checks = [
-              ("DonateStrategy", [
-                  src / "CMakeLists.txt",
-                  src / "src/net/Network.cpp",
-                  src / "src/net/Network.h",
-              ]),
-              ("m_donate", [
-                  src / "src/net/Network.cpp",
-                  src / "src/net/Network.h",
-              ]),
-              ("dev donate", [
-                  src / "src/net/Network.cpp",
-                  src / "src/net/Network.h",
-              ]),
-              ("donate.v2.xmrig.com", [
-                  src / "src/net/Network.cpp",
-                  src / "src/net/Network.h",
-              ]),
-              ("donate.ssl.xmrig.com", [
-                  src / "src/net/Network.cpp",
-                  src / "src/net/Network.h",
-              ]),
+          verify_files = [
+              src / 'CMakeLists.txt',
+              src / 'src/net/Network.cpp',
+              src / 'src/net/Network.h',
           ]
 
-          for needle, files in checks:
-              for file in files:
-                  if needle in file.read_text():
-                      fail(f"Residual donation reference found: {needle} in {file}")
+          for file in verify_files:
+              data = file.read_text()
 
-          print("Donation code removal verification passed.")
+              if 'DonateStrategy' in data:
+                  raise SystemExit(f'Residual DonateStrategy reference: {file}')
+
+          if 'kDefaultDonateLevel = 0' not in donate_h.read_text():
+              raise SystemExit('Default donation level was not changed to 0')
+
+          if 'kMinimumDonateLevel = 0' not in donate_h.read_text():
+              raise SystemExit('Minimum donation level was not changed to 0')
+
+          if 'if (pools.donateLevel() > 0)' in network_cpp.read_text():
+              raise SystemExit('Donation strategy creation code still exists')
+
+          print('Donation removal verification passed.')
           PY
 
           cd "$SRC"
@@ -343,18 +259,18 @@ jobs:
           from pathlib import Path
           import sys
 
-          path = Path(sys.argv[1])
-          text = path.read_text()
+          cpu_cmake = Path(sys.argv[1])
+          text = cpu_cmake.read_text()
 
-          old = "CHECK_CXX_COMPILER_FLAG(-march=armv8-a+crypto XMRIG_ARM_CRYPTO)"
-          new = "set(XMRIG_ARM_CRYPTO OFF)"
+          old = 'CHECK_CXX_COMPILER_FLAG(-march=armv8-a+crypto XMRIG_ARM_CRYPTO)'
+          new = 'set(XMRIG_ARM_CRYPTO OFF)'
 
           count = text.count(old)
 
           if count != 1:
-              raise SystemExit(f"Expected one ARM crypto compiler probe, found {count}")
+              raise SystemExit(f'ARM crypto check replacement failed: expected 1 match, found {count}')
 
-          path.write_text(text.replace(old, new, 1))
+          cpu_cmake.write_text(text.replace(old, new, 1))
           PY
 
           build_xmrig \
@@ -386,12 +302,12 @@ jobs:
 
             if strings "./$BIN" | grep -Eqi 'donate\.v2\.xmrig\.com|donate\.ssl\.xmrig\.com|dev donate started|dev donate finished'
             then
-              echo "Donation-related runtime string found in $BIN"
+              echo "Donation-related string found in $BIN"
               exit 1
             fi
           done
 
-          echo "Verification passed."
+          echo "Verification passed: static binaries run and no donation runtime strings were found."
           EOF
 
           cat > "$OUT/runtime/config.json.example" <<'EOF'
@@ -436,7 +352,7 @@ jobs:
 
             if readelf -d "$BIN" 2>/dev/null | grep -q "NEEDED"
             then
-              echo "Dynamic dependency detected in $BIN"
+              echo "Dynamic library dependency found in $BIN"
               exit 1
             fi
 
@@ -451,15 +367,14 @@ jobs:
 
           cat > "$OUT/BUILD-MANIFEST.txt" <<EOF
           XMRig tag: v6.26.0
-          XMRig commit: $(git -C "$SRC" rev-parse HEAD)
-          Build target: Linux aarch64 musl static
-          Compiler environment: Alpine Linux musl
+          XMRig source commit: $(git -C "$SRC" rev-parse HEAD)
+          Target: Linux aarch64, musl, static ELF
           Static dependencies: libuv, hwloc, OpenSSL
           Enabled: RandomX, Argon2, TLS, hwloc, ASM, benchmark, ARMv8
           Disabled: DonateStrategy, HTTP API, MSR, CUDA, OpenCL
-          Binaries:
-            xmrig-aarch64-baseline: ARMv8 baseline
-            xmrig-aarch64-crypto: ARMv8 Crypto/AES extension build
+          Output:
+            xmrig-aarch64-baseline = ARMv8 general compatibility
+            xmrig-aarch64-crypto   = ARMv8 AES/crypto-extension optimized
           EOF
 
           cd "$OUT"
