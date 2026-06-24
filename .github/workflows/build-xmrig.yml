@@ -1,0 +1,259 @@
+name: Build XMRig ARM64 Static No-Donate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Build static ARM64 binaries from official source
+        shell: bash
+        run: |
+          cat > build.sh <<'SH'
+          #!/bin/sh
+          set -eux
+
+          apk add --no-cache \
+            bash \
+            git \
+            build-base \
+            cmake \
+            autoconf \
+            automake \
+            libtool \
+            pkgconf \
+            linux-headers \
+            perl \
+            wget \
+            tar \
+            gzip \
+            xz \
+            ca-certificates \
+            coreutils \
+            file
+
+          WORK=/work/work
+          OUT=/work/out
+
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK" "$OUT/runtime"
+
+          cd "$WORK"
+          git clone --depth 1 --branch v6.26.0 https://github.com/xmrig/xmrig.git xmrig
+
+          SRC="$WORK/xmrig"
+          cd "$SRC"
+
+          sed -i '/src\/net\/strategies\/DonateStrategy\.h/d' CMakeLists.txt
+          sed -i '/src\/net\/strategies\/DonateStrategy\.cpp/d' CMakeLists.txt
+          sed -i '/net\/strategies\/DonateStrategy.h/d' src/net/Network.cpp
+
+          sed -i 's/kDefaultDonateLevel = 1/kDefaultDonateLevel = 0/' src/donate.h
+          sed -i 's/kMinimumDonateLevel = 1/kMinimumDonateLevel = 0/' src/donate.h
+
+          perl -0pi -e 's{\n\s*const Pools &pools = controller->config\(\)->pools\(\);\n\n\s*m_strategy = pools\.createStrategy\(m_state\);\n\n\s*if \(pools\.donateLevel\(\) > 0\) \{\n\s*m_donate = new DonateStrategy\(controller, this\);\n\s*\}\n}{\n    m_strategy = controller->config()->pools().createStrategy(m_state);\n}s' src/net/Network.cpp
+
+          perl -0pi -e 's{\n\s*if \(m_donate && m_donate == strategy\) \{\n\s*LOG_NOTICE\("%s " WHITE_BOLD\("dev donate started"\), Tags::network\(\)\);\n\s*return;\n\s*\}\n}{}s' src/net/Network.cpp
+
+          perl -0pi -e 's{\n\s*if \(m_donate && m_donate->isActive\(\) && m_donate != strategy\) \{\n\s*return;\n\s*\}\n\n\s*setJob\(client, job, m_donate == strategy\);}{\n    setJob(client, job, false);}s' src/net/Network.cpp
+
+          perl -0pi -e 's{\n\s*if \(result\.index == 1 && m_donate\) \{\n\s*m_donate->submit\(result\);\n\s*return;\n\s*\}\n}{}s' src/net/Network.cpp
+
+          perl -0pi -e 's{\n\s*if \(m_donate && m_donate == strategy\) \{\n\s*LOG_NOTICE\("%s " WHITE_BOLD\("dev donate finished"\), Tags::network\(\)\);\n\s*m_strategy->resume\(\);\n\s*\}\n}{}s' src/net/Network.cpp
+
+          perl -0pi -e 's{\n\s*if \(!donate && m_donate\) \{\n\s*static_cast<DonateStrategy \*>\(m_donate\)->update\(client, job\);\n\s*\}\n}{}s' src/net/Network.cpp
+
+          perl -0pi -e 's{\n\s*if \(m_donate\) \{\n\s*m_donate->tick\(now\);\n\s*\}\n}{}s' src/net/Network.cpp
+
+          grep -q 'kDefaultDonateLevel = 0' src/donate.h
+          grep -q 'kMinimumDonateLevel = 0' src/donate.h
+          ! grep -q 'DonateStrategy' CMakeLists.txt
+          ! grep -q 'DonateStrategy' src/net/Network.cpp
+          test "$(grep -c 'm_donate' src/net/Network.cpp)" -eq 1
+
+          git diff --check
+          git diff > "$OUT/SOURCE-PATCH.diff"
+          git rev-parse HEAD > "$OUT/XMRIG-COMMIT.txt"
+
+          cd "$SRC/scripts"
+          ./build_deps.sh
+
+          build_xmrig() {
+            SOURCE_DIR="$1"
+            BUILD_DIR="$2"
+            OUTPUT_FILE="$3"
+
+            cmake -S "$SOURCE_DIR" -B "$BUILD_DIR" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DXMRIG_DEPS="$SOURCE_DIR/scripts/deps" \
+              -DBUILD_STATIC=ON \
+              -DARM_V8=ON \
+              -DWITH_RANDOMX=ON \
+              -DWITH_ARGON2=ON \
+              -DWITH_TLS=ON \
+              -DWITH_HWLOC=ON \
+              -DWITH_ASM=ON \
+              -DWITH_BENCHMARK=ON \
+              -DWITH_HTTP=OFF \
+              -DWITH_DMI=OFF \
+              -DWITH_MSR=OFF \
+              -DWITH_ENV_VARS=OFF \
+              -DWITH_OPENCL=OFF \
+              -DWITH_CUDA=OFF \
+              -DWITH_KAWPOW=OFF \
+              -DWITH_GHOSTRIDER=OFF \
+              -DWITH_CN_LITE=OFF \
+              -DWITH_CN_HEAVY=OFF \
+              -DWITH_CN_PICO=OFF \
+              -DWITH_CN_FEMTO=OFF
+
+            cmake --build "$BUILD_DIR" --parallel 2
+            cp "$BUILD_DIR/xmrig" "$OUTPUT_FILE"
+            chmod 755 "$OUTPUT_FILE"
+          }
+
+          build_xmrig \
+            "$SRC" \
+            "$WORK/build-crypto" \
+            "$OUT/runtime/xmrig-aarch64-crypto"
+
+          BASE="$WORK/xmrig-baseline"
+          cp -a "$SRC" "$BASE"
+
+          perl -0pi -e 's{CHECK_CXX_COMPILER_FLAG\(-march=armv8-a\+crypto XMRIG_ARM_CRYPTO\)}{set(XMRIG_ARM_CRYPTO OFF)}g; s{-march=armv8-a\+crypto}{-march=armv8-a}g' "$BASE/cmake/cpu.cmake"
+
+          grep -q 'set(XMRIG_ARM_CRYPTO OFF)' "$BASE/cmake/cpu.cmake"
+
+          build_xmrig \
+            "$BASE" \
+            "$WORK/build-baseline" \
+            "$OUT/runtime/xmrig-aarch64-baseline"
+
+          git -C "$BASE" diff > "$OUT/BASELINE-PATCH.diff"
+
+          cat > "$OUT/runtime/run.sh" <<'EOF'
+          #!/bin/sh
+          set -eu
+
+          DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+          if grep -m1 '^Features' /proc/cpuinfo 2>/dev/null | grep -qw aes; then
+            exec "$DIR/xmrig-aarch64-crypto" "$@"
+          fi
+
+          exec "$DIR/xmrig-aarch64-baseline" "$@"
+          EOF
+
+          cat > "$OUT/runtime/verify.sh" <<'EOF'
+          #!/bin/sh
+          set -eu
+
+          for BIN in xmrig-aarch64-baseline xmrig-aarch64-crypto
+          do
+            test -x "$BIN"
+            "./$BIN" --version
+
+            if grep -aEqi 'donate\.xmrig|dev donate started|dev donate finished' "./$BIN"
+            then
+              echo "Donation-related string found in $BIN"
+              exit 1
+            fi
+          done
+
+          echo "Verification passed: both binaries run and no donation strings were found."
+          EOF
+
+          cat > "$OUT/runtime/config.json.example" <<'EOF'
+          {
+            "autosave": false,
+            "background": false,
+            "donate-level": 0,
+            "cpu": {
+              "enabled": true,
+              "huge-pages": true,
+              "huge-pages-jit": true,
+              "yield": false,
+              "max-threads-hint": 100,
+              "asm": true
+            },
+            "randomx": {
+              "init": -1,
+              "mode": "fast",
+              "1gb-pages": false,
+              "rdmsr": false,
+              "wrmsr": false
+            },
+            "pools": [
+              {
+                "coin": "monero",
+                "url": "POOL_HOST:PORT",
+                "user": "YOUR_XMR_PUBLIC_ADDRESS",
+                "pass": "aarch64-2c",
+                "tls": true,
+                "keepalive": true
+              }
+            ]
+          }
+          EOF
+
+          chmod 755 "$OUT/runtime/run.sh"
+          chmod 755 "$OUT/runtime/verify.sh"
+
+          for BIN in "$OUT/runtime/xmrig-aarch64-baseline" "$OUT/runtime/xmrig-aarch64-crypto"
+          do
+            file "$BIN" | grep -qi 'statically linked'
+
+            if readelf -d "$BIN" | grep -q '(NEEDED)'
+            then
+              echo "Dynamic dependency detected in $BIN"
+              exit 1
+            fi
+
+            "$BIN" --version
+
+            if grep -aEqi 'donate\.xmrig|dev donate started|dev donate finished' "$BIN"
+            then
+              echo "Donation-related string found in $BIN"
+              exit 1
+            fi
+          done
+
+          cat > "$OUT/BUILD-MANIFEST.txt" <<EOF
+          XMRig tag: v6.26.0
+          XMRig commit: $(git -C "$SRC" rev-parse HEAD)
+          Build target: Linux aarch64 musl static
+          Static dependencies: libuv, hwloc, OpenSSL
+          Enabled: RandomX, ARMv8, TLS, hwloc, ASM, benchmark
+          Disabled: developer donation strategy, HTTP API, MSR, CUDA, OpenCL
+          EOF
+
+          cd "$OUT"
+          sha256sum runtime/* > SHA256SUMS
+          tar -czf xmrig-aarch64-static-nodonate-v6.26.0.tar.gz \
+            runtime \
+            SHA256SUMS \
+            BUILD-MANIFEST.txt \
+            XMRIG-COMMIT.txt \
+            SOURCE-PATCH.diff \
+            BASELINE-PATCH.diff
+          SH
+
+          chmod +x build.sh
+
+          docker run --rm --platform linux/arm64 \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            alpine:3.21 \
+            sh /work/build.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xmrig-aarch64-static-nodonate-v6.26.0
+          path: out/
+          if-no-files-found: error
