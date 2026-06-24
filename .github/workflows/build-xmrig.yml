@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Build static ARM64 XMRig from official source
+      - name: Build fully static ARM64 binaries from official XMRig source
         shell: bash
         run: |
           set -euo pipefail
@@ -50,15 +50,13 @@ jobs:
           rm -rf "$WORK" "$OUT"
           mkdir -p "$WORK" "$OUT/runtime"
 
-          cd "$WORK"
-
-          git clone --depth 1 --branch v6.26.0 https://github.com/xmrig/xmrig.git xmrig
+          git clone --depth 1 --branch v6.26.0 https://github.com/xmrig/xmrig.git "$SRC"
 
           EXPECTED_COMMIT="b2ca72480c58d197e18c885d9fc1a0c8d517e60a"
           ACTUAL_COMMIT="$(git -C "$SRC" rev-parse HEAD)"
 
           if [ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]; then
-            echo "Unexpected XMRig source commit: $ACTUAL_COMMIT"
+            echo "Unexpected source commit: $ACTUAL_COMMIT"
             exit 1
           fi
 
@@ -70,33 +68,25 @@ jobs:
           src = Path(sys.argv[1])
 
           cmake_file = src / "CMakeLists.txt"
-          network_cpp = src / "src/net/Network.cpp"
-          network_h = src / "src/net/Network.h"
-          donate_h = src / "src/donate.h"
-          donate_cpp = src / "src/net/strategies/DonateStrategy.cpp"
-          donate_header = src / "src/net/strategies/DonateStrategy.h"
+          network_cpp_file = src / "src/net/Network.cpp"
+          network_h_file = src / "src/net/Network.h"
+          donate_h_file = src / "src/donate.h"
+          donate_cpp_file = src / "src/net/strategies/DonateStrategy.cpp"
+          donate_strategy_h_file = src / "src/net/strategies/DonateStrategy.h"
 
           def fail(message):
               raise SystemExit(message)
 
-          def replace_once_regex(text, pattern, replacement, label, flags=re.MULTILINE):
-              result, count = re.subn(pattern, replacement, text, count=1, flags=flags)
-
-              if count != 1:
-                  fail(f"{label}: expected 1 match, found {count}")
-
-              return result
-
-          def remove_block(text, marker, label):
-              start = text.find(marker)
+          def replace_function(text, signature, replacement):
+              start = text.find(signature)
 
               if start < 0:
-                  fail(f"{label}: marker not found: {marker}")
+                  fail(f"Function not found: {signature}")
 
               brace = text.find("{", start)
 
               if brace < 0:
-                  fail(f"{label}: opening brace not found")
+                  fail(f"Opening brace not found: {signature}")
 
               depth = 0
               end = None
@@ -114,166 +104,256 @@ jobs:
                           break
 
               if end is None:
-                  fail(f"{label}: closing brace not found")
+                  fail(f"Closing brace not found: {signature}")
 
-              while end < len(text) and text[end] in " \t":
-                  end += 1
+              return text[:start] + replacement.rstrip() + "\n" + text[end:]
 
-              if end < len(text) and text[end] == "\n":
-                  end += 1
-
-              return text[:start] + text[end:]
+          def write_clean(path, text):
+              cleaned = "\n".join(line.rstrip() for line in text.splitlines()) + "\n"
+              path.write_text(cleaned)
 
           cmake = cmake_file.read_text()
+          cmake_lines = cmake.splitlines()
 
-          cmake = replace_once_regex(
-              cmake,
-              r"^[ \t]*src/net/strategies/DonateStrategy\.h[ \t]*\n",
-              "",
-              "Remove DonateStrategy.h from CMakeLists.txt"
-          )
+          removed_cmake_entries = 0
+          new_cmake_lines = []
 
-          cmake = replace_once_regex(
-              cmake,
-              r"^[ \t]*src/net/strategies/DonateStrategy\.cpp[ \t]*\n",
-              "",
-              "Remove DonateStrategy.cpp from CMakeLists.txt"
-          )
+          for line in cmake_lines:
+              if "src/net/strategies/DonateStrategy.h" in line:
+                  removed_cmake_entries += 1
+                  continue
 
-          cmake_file.write_text(cmake)
+              if "src/net/strategies/DonateStrategy.cpp" in line:
+                  removed_cmake_entries += 1
+                  continue
 
-          network = network_cpp.read_text()
+              new_cmake_lines.append(line)
 
-          network = replace_once_regex(
+          if removed_cmake_entries != 2:
+              fail(f"Expected to remove 2 DonateStrategy CMake entries, removed {removed_cmake_entries}")
+
+          write_clean(cmake_file, "\n".join(new_cmake_lines))
+
+          network = network_cpp_file.read_text()
+          network_lines = network.splitlines()
+
+          replaced_include = 0
+          new_network_lines = []
+
+          for line in network_lines:
+              if '#include "net/strategies/DonateStrategy.h"' in line:
+                  new_network_lines.append('#include "base/kernel/interfaces/IStrategy.h"')
+                  replaced_include += 1
+                  continue
+
+              new_network_lines.append(line)
+
+          if replaced_include != 1:
+              fail(f"Expected to replace 1 DonateStrategy include, replaced {replaced_include}")
+
+          network = "\n".join(new_network_lines) + "\n"
+
+          network = replace_function(
               network,
-              r'^#include "net/strategies/DonateStrategy\.h"\n',
-              '#include "base/kernel/interfaces/IStrategy.h"\n',
-              "Replace DonateStrategy include with IStrategy include"
+              "xmrig::Network::Network(Controller *controller)",
+              r'''xmrig::Network::Network(Controller *controller) :
+    m_controller(controller)
+{
+    JobResults::setListener(this, controller->config()->cpu().isHwAES());
+    controller->addListener(this);
+
+#   ifdef XMRIG_FEATURE_API
+    controller->api()->addListener(this);
+#   endif
+
+    m_state = new NetworkState(this);
+    m_strategy = controller->config()->pools().createStrategy(m_state);
+    m_timer = new Timer(this, kTickInterval, kTickInterval);
+}'''
           )
 
-          network = remove_block(
+          network = replace_function(
               network,
-              "if (pools.donateLevel() > 0)",
-              "Remove donation strategy construction block"
+              "xmrig::Network::~Network()",
+              r'''xmrig::Network::~Network()
+{
+    JobResults::stop();
+
+    delete m_timer;
+    delete m_strategy;
+    delete m_state;
+}'''
           )
 
-          network = replace_once_regex(
+          network = replace_function(
               network,
-              r"^[ \t]*delete[ \t]+m_donate[ \t]*;[ \t]*\n",
-              "",
-              "Remove m_donate destructor"
+              "void xmrig::Network::onActive(",
+              r'''void xmrig::Network::onActive(IStrategy *, IClient *client)
+{
+    const auto &pool = client->pool();
+
+#   ifdef XMRIG_FEATURE_BENCHMARK
+    if (pool.mode() == Pool::MODE_BENCHMARK) {
+        return;
+    }
+#   endif
+
+    char zmq_buf[32] = {};
+
+    if (client->pool().zmq_port() >= 0) {
+        snprintf(zmq_buf, sizeof(zmq_buf), " (ZMQ:%d)", client->pool().zmq_port());
+    }
+
+    const char *tlsVersion = client->tlsVersion();
+
+    LOG_INFO("%s " WHITE_BOLD("use %s ") CYAN_BOLD("%s:%d%s ") GREEN_BOLD("%s") " " BLACK_BOLD("%s"),
+             Tags::network(),
+             client->mode(),
+             pool.host().data(),
+             pool.port(),
+             zmq_buf,
+             tlsVersion ? tlsVersion : "",
+             client->ip().data());
+
+    const char *fingerprint = client->tlsFingerprint();
+
+    if (fingerprint != nullptr) {
+        LOG_INFO("%s " BLACK_BOLD("fingerprint (SHA-256): \"%s\""), Tags::network(), fingerprint);
+    }
+}'''
           )
 
-          while "if (m_donate && m_donate == strategy)" in network:
-              network = remove_block(
-                  network,
-                  "if (m_donate && m_donate == strategy)",
-                  "Remove donation active/pause branch"
-              )
-
-          network = remove_block(
+          network = replace_function(
               network,
-              "if (m_donate && m_donate->isActive() && m_donate != strategy)",
-              "Remove donation job interception branch"
+              "void xmrig::Network::onJob(",
+              r'''void xmrig::Network::onJob(IStrategy *, IClient *client, const Job &job, const rapidjson::Value &)
+{
+    setJob(client, job);
+}'''
           )
 
-          network = replace_once_regex(
+          network = replace_function(
               network,
-              r"^[ \t]*setJob\(client,[ \t]*job,[ \t]*m_donate[ \t]*==[ \t]*strategy\);[ \t]*\n",
-              "    setJob(client, job);\n",
-              "Route every job to normal pool"
+              "void xmrig::Network::onJobResult(",
+              r'''void xmrig::Network::onJobResult(const JobResult &result)
+{
+    m_strategy->submit(result);
+}'''
           )
 
-          network = remove_block(
+          network = replace_function(
               network,
-              "if (result.index == 1 && m_donate)",
-              "Remove donation result submission branch"
+              "void xmrig::Network::onPause(",
+              r'''void xmrig::Network::onPause(IStrategy *)
+{
+    if (!m_strategy->isActive()) {
+        LOG_ERR("%s " RED("no active pools, stop mining"), Tags::network());
+        return m_controller->miner()->pause();
+    }
+}'''
           )
 
-          network = remove_block(
+          network = replace_function(
               network,
-              "if (!donate && m_donate)",
-              "Remove donation job update branch"
+              "void xmrig::Network::setJob(",
+              r'''void xmrig::Network::setJob(IClient *, const Job &job)
+{
+    m_controller->miner()->setJob(job, false);
+}'''
           )
 
-          while "if (m_donate)" in network:
-              network = remove_block(
-                  network,
-                  "if (m_donate)",
-                  "Remove donation tick branch"
-              )
-
-          network = replace_once_regex(
+          network = replace_function(
               network,
-              r"void[ \t]+xmrig::Network::setJob[ \t]*\([ \t]*IClient[ \t]*\*[ \t]*client,[ \t]*const[ \t]+Job[ \t]*&[ \t]*job,[ \t]*bool[ \t]+donate[ \t]*\)",
-              "void xmrig::Network::setJob(IClient *client, const Job &job)",
-              "Remove donate parameter from setJob definition",
-              flags=0
+              "void xmrig::Network::tick()",
+              r'''void xmrig::Network::tick()
+{
+    const uint64_t now = Chrono::steadyMSecs();
+
+    m_strategy->tick(now);
+
+#   ifdef XMRIG_FEATURE_API
+    m_controller->api()->tick();
+#   endif
+}'''
           )
 
-          network = replace_once_regex(
-              network,
-              r"^[ \t]*m_controller->miner\(\)->setJob\(job,[ \t]*donate\);[ \t]*\n",
-              "    m_controller->miner()->setJob(job, false);\n",
-              "Force normal-pool job flag"
-          )
+          write_clean(network_cpp_file, network)
 
-          network_cpp.write_text(network)
+          header = network_h_file.read_text()
+          header_lines = header.splitlines()
 
-          header = network_h.read_text()
+          changed_setjob = 0
+          removed_m_donate = 0
+          new_header_lines = []
 
-          header = replace_once_regex(
-              header,
-              r"^[ \t]*void[ \t]+setJob[ \t]*\([ \t]*IClient[ \t]*\*[ \t]*client,[ \t]*const[ \t]+Job[ \t]*&[ \t]*job,[ \t]*bool[ \t]+donate[ \t]*\)[ \t]*;[ \t]*\n",
-              "    void setJob(IClient *client, const Job &job);\n",
-              "Remove donate parameter from Network.h"
-          )
+          for line in header_lines:
+              if "void setJob(" in line and "bool donate" in line:
+                  indent = line[:len(line) - len(line.lstrip())]
+                  new_header_lines.append(f"{indent}void setJob(IClient *client, const Job &job);")
+                  changed_setjob += 1
+                  continue
 
-          header = replace_once_regex(
-              header,
-              r"^[ \t]*IStrategy[ \t]*\*[ \t]*m_donate[ \t]*=[ \t]*nullptr[ \t]*;[ \t]*\n",
-              "",
-              "Remove m_donate field from Network.h"
-          )
+              if "m_donate" in line:
+                  removed_m_donate += 1
+                  continue
 
-          network_h.write_text(header)
+              new_header_lines.append(line)
 
-          donate_h.write_text(
+          if changed_setjob != 1:
+              fail(f"Expected to rewrite one setJob declaration, changed {changed_setjob}")
+
+          if removed_m_donate != 1:
+              fail(f"Expected to remove one m_donate member, removed {removed_m_donate}")
+
+          write_clean(network_h_file, "\n".join(new_header_lines))
+
+          donate_h_file.write_text(
               """#ifndef XMRIG_DONATE_H
-          #define XMRIG_DONATE_H
+#define XMRIG_DONATE_H
 
-          constexpr const int kDefaultDonateLevel = 0;
-          constexpr const int kMinimumDonateLevel = 0;
+constexpr const int kDefaultDonateLevel = 0;
+constexpr const int kMinimumDonateLevel = 0;
 
-          #endif // XMRIG_DONATE_H
-          """
+#endif // XMRIG_DONATE_H
+"""
           )
 
-          if not donate_cpp.exists() or not donate_header.exists():
-              fail("DonateStrategy source files missing before deletion")
+          if not donate_cpp_file.exists():
+              fail("DonateStrategy.cpp missing before removal")
 
-          donate_cpp.unlink()
-          donate_header.unlink()
+          if not donate_strategy_h_file.exists():
+              fail("DonateStrategy.h missing before removal")
 
-          for file in [cmake_file, network_cpp, network_h]:
+          donate_cpp_file.unlink()
+          donate_strategy_h_file.unlink()
+
+          for file in [cmake_file, network_cpp_file, network_h_file]:
               content = file.read_text()
 
-              for needle in [
+              for forbidden in [
                   "DonateStrategy",
                   "m_donate",
                   "dev donate",
                   "donate.v2.xmrig.com",
                   "donate.ssl.xmrig.com",
               ]:
-                  if needle in content:
-                      fail(f"Residual forbidden reference '{needle}' in {file}")
+                  if forbidden in content:
+                      fail(f"Residual forbidden text '{forbidden}' in {file}")
+
+          if donate_cpp_file.exists() or donate_strategy_h_file.exists():
+              fail("DonateStrategy files still exist after removal")
+
+          if "kDefaultDonateLevel = 0" not in donate_h_file.read_text():
+              fail("Default donation level was not set to 0")
+
+          if "kMinimumDonateLevel = 0" not in donate_h_file.read_text():
+              fail("Minimum donation level was not set to 0")
 
           print("Donation code removal verification passed.")
           PY
 
           cd "$SRC"
 
-          git diff --check
           git rev-parse HEAD > "$OUT/XMRIG-COMMIT.txt"
           git diff --binary > "$OUT/SOURCE-PATCH.diff"
           cp LICENSE "$OUT/LICENSE"
@@ -327,23 +407,18 @@ jobs:
 
           python3 - "$BASE/cmake/cpu.cmake" <<'PY'
           from pathlib import Path
-          import re
           import sys
 
           path = Path(sys.argv[1])
           text = path.read_text()
 
-          result, count = re.subn(
-              r'CHECK_CXX_COMPILER_FLAG\([ \t]*-march=armv8-a\+crypto[ \t]+XMRIG_ARM_CRYPTO[ \t]*\)',
-              'set(XMRIG_ARM_CRYPTO OFF)',
-              text,
-              count=1
-          )
+          old = "CHECK_CXX_COMPILER_FLAG(-march=armv8-a+crypto XMRIG_ARM_CRYPTO)"
+          new = "set(XMRIG_ARM_CRYPTO OFF)"
 
-          if count != 1:
-              raise SystemExit(f"Baseline ARM patch failed: expected 1 match, found {count}")
+          if old not in text:
+              raise SystemExit("Could not locate ARM crypto compiler probe for baseline build")
 
-          path.write_text(result)
+          path.write_text(text.replace(old, new, 1))
           PY
 
           build_xmrig \
@@ -368,7 +443,7 @@ jobs:
             auto)
               if awk '
                 /^[Ff]eatures/ && $0 ~ /(^|[[:space:]])aes([[:space:]]|$)/ {
-                  found=1
+                  found = 1
                 }
                 END {
                   exit !found
@@ -446,7 +521,7 @@ jobs:
           for BIN in "$OUT/runtime/xmrig-aarch64-baseline" "$OUT/runtime/xmrig-aarch64-crypto"
           do
             if ! file "$BIN" | grep -qi "statically linked"; then
-              echo "Not a static binary: $BIN"
+              echo "Binary is not statically linked: $BIN"
               exit 1
             fi
 
@@ -467,16 +542,17 @@ jobs:
           cat > "$OUT/BUILD-MANIFEST.txt" <<EOF
           XMRig version: v6.26.0
           XMRig source commit: $(git -C "$SRC" rev-parse HEAD)
-          Target: Linux aarch64 musl static ELF
+          Build target: Linux aarch64 musl static ELF
           Static dependencies: libuv, hwloc, OpenSSL
           Enabled: RandomX, Argon2, TLS, hwloc, ASM, benchmark, ARMv8
           Disabled: DonateStrategy, HTTP API, MSR, CUDA, OpenCL
           Binaries:
-            xmrig-aarch64-baseline = ARMv8 generic compatibility
-            xmrig-aarch64-crypto = ARMv8 + AES/crypto extension
+            xmrig-aarch64-baseline = ARMv8 generic compatibility build
+            xmrig-aarch64-crypto = ARMv8 AES/crypto-extension build
           EOF
 
           cd "$OUT"
+
           sha256sum runtime/* > SHA256SUMS
 
           tar -czf xmrig-aarch64-musl-static-nodonate-v6.26.0.tar.gz \
@@ -499,7 +575,7 @@ jobs:
             alpine:3.21 \
             sh /work/build.sh
 
-      - name: Upload artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: xmrig-aarch64-musl-static-nodonate-v6.26.0
