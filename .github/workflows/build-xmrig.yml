@@ -9,7 +9,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 50
+    timeout-minutes: 55
 
     steps:
       - name: Build static ARM64 XMRig from official source
@@ -32,7 +32,6 @@ jobs:
             pkgconf \
             linux-headers \
             perl \
-            python3 \
             wget \
             tar \
             gzip \
@@ -62,151 +61,49 @@ jobs:
             exit 1
           fi
 
-          python3 - "$SRC" <<'PY'
-          from pathlib import Path
-          import re
-          import sys
+          sed -i '/DonateStrategy/d' "$SRC/CMakeLists.txt"
+          sed -i '/DonateStrategy/d' "$SRC/src/net/Network.cpp"
 
-          src = Path(sys.argv[1])
+          sed -i 's/constexpr const int kDefaultDonateLevel = 1;/constexpr const int kDefaultDonateLevel = 0;/' "$SRC/src/donate.h"
+          sed -i 's/constexpr const int kMinimumDonateLevel = 1;/constexpr const int kMinimumDonateLevel = 0;/' "$SRC/src/donate.h"
 
-          cmake_file = src / "CMakeLists.txt"
-          network_cpp = src / "src/net/Network.cpp"
-          donate_h = src / "src/donate.h"
-          donate_cpp = src / "src/net/strategies/DonateStrategy.cpp"
-          donate_header = src / "src/net/strategies/DonateStrategy.h"
+          rm -f "$SRC/src/net/strategies/DonateStrategy.cpp"
+          rm -f "$SRC/src/net/strategies/DonateStrategy.h"
 
-          def require_single_sub(pattern, repl, text, label, flags=0):
-              new_text, count = re.subn(pattern, repl, text, count=1, flags=flags)
+          if grep -R -n \
+            --exclude-dir=.git \
+            --include='*.cpp' \
+            --include='*.h' \
+            --include='CMakeLists.txt' \
+            'DonateStrategy' \
+            "$SRC"
+          then
+            echo "Donation strategy reference remains in source."
+            exit 1
+          fi
 
-              if count != 1:
-                  raise SystemExit(f"{label}: expected exactly 1 match, found {count}")
+          if grep -n 'new DonateStrategy' "$SRC/src/net/Network.cpp"; then
+            echo "Donation strategy construction remains in Network.cpp."
+            exit 1
+          fi
 
-              return new_text
+          if ! grep -q 'kDefaultDonateLevel = 0' "$SRC/src/donate.h"; then
+            echo "Default donation level was not changed to zero."
+            exit 1
+          fi
 
-          def remove_cpp_block(text, marker, label):
-              start = text.find(marker)
+          if ! grep -q 'kMinimumDonateLevel = 0' "$SRC/src/donate.h"; then
+            echo "Minimum donation level was not changed to zero."
+            exit 1
+          fi
 
-              if start < 0:
-                  raise SystemExit(f"{label}: marker not found")
-
-              brace = text.find("{", start)
-
-              if brace < 0:
-                  raise SystemExit(f"{label}: opening brace not found")
-
-              depth = 0
-              end = None
-
-              for pos in range(brace, len(text)):
-                  char = text[pos]
-
-                  if char == "{":
-                      depth += 1
-                  elif char == "}":
-                      depth -= 1
-
-                      if depth == 0:
-                          end = pos + 1
-                          break
-
-              if end is None:
-                  raise SystemExit(f"{label}: closing brace not found")
-
-              while end < len(text) and text[end] in " \t":
-                  end += 1
-
-              if end < len(text) and text[end] == "\n":
-                  end += 1
-
-              return text[:start] + text[end:]
-
-          cmake = cmake_file.read_text()
-
-          cmake = require_single_sub(
-              r'^[ \t]*src/net/strategies/DonateStrategy\.h[ \t]*\n',
-              '',
-              cmake,
-              'Remove DonateStrategy.h from CMakeLists.txt',
-              re.MULTILINE
-          )
-
-          cmake = require_single_sub(
-              r'^[ \t]*src/net/strategies/DonateStrategy\.cpp[ \t]*\n',
-              '',
-              cmake,
-              'Remove DonateStrategy.cpp from CMakeLists.txt',
-              re.MULTILINE
-          )
-
-          cmake_file.write_text(cmake)
-
-          network = network_cpp.read_text()
-
-          network = require_single_sub(
-              r'^#include "net/strategies/DonateStrategy\.h"\n',
-              '',
-              network,
-              'Remove DonateStrategy include',
-              re.MULTILINE
-          )
-
-          network = remove_cpp_block(
-              network,
-              'if (pools.donateLevel() > 0)',
-              'Remove donation strategy construction block'
-          )
-
-          network_cpp.write_text(network)
-
-          donate_h.write_text(
-              """#ifndef XMRIG_DONATE_H
-          #define XMRIG_DONATE_H
-
-          constexpr const int kDefaultDonateLevel = 0;
-          constexpr const int kMinimumDonateLevel = 0;
-
-          #endif // XMRIG_DONATE_H
-          """
-          )
-
-          if not donate_cpp.exists():
-              raise SystemExit('DonateStrategy.cpp does not exist before deletion')
-
-          if not donate_header.exists():
-              raise SystemExit('DonateStrategy.h does not exist before deletion')
-
-          donate_cpp.unlink()
-          donate_header.unlink()
-
-          verify_files = [
-              src / 'CMakeLists.txt',
-              src / 'src/net/Network.cpp',
-              src / 'src/net/Network.h',
-          ]
-
-          for file in verify_files:
-              data = file.read_text()
-
-              if 'DonateStrategy' in data:
-                  raise SystemExit(f'Residual DonateStrategy reference: {file}')
-
-          if 'kDefaultDonateLevel = 0' not in donate_h.read_text():
-              raise SystemExit('Default donation level was not changed to 0')
-
-          if 'kMinimumDonateLevel = 0' not in donate_h.read_text():
-              raise SystemExit('Minimum donation level was not changed to 0')
-
-          if 'if (pools.donateLevel() > 0)' in network_cpp.read_text():
-              raise SystemExit('Donation strategy creation code still exists')
-
-          print('Donation removal verification passed.')
-          PY
+          echo "Donation source removal verification passed."
 
           cd "$SRC"
 
           git diff --check
           git rev-parse HEAD > "$OUT/XMRIG-COMMIT.txt"
-          git diff > "$OUT/SOURCE-PATCH.diff"
+          git diff --binary > "$OUT/SOURCE-PATCH.diff"
           cp LICENSE "$OUT/LICENSE"
 
           cd "$SRC/scripts"
@@ -255,23 +152,12 @@ jobs:
 
           cp -a "$SRC" "$BASE"
 
-          python3 - "$BASE/cmake/cpu.cmake" <<'PY'
-          from pathlib import Path
-          import sys
+          sed -i 's/^[[:space:]]*CHECK_CXX_COMPILER_FLAG(-march=armv8-a+crypto XMRIG_ARM_CRYPTO)[[:space:]]*$/        set(XMRIG_ARM_CRYPTO OFF)/' "$BASE/cmake/cpu.cmake"
 
-          cpu_cmake = Path(sys.argv[1])
-          text = cpu_cmake.read_text()
-
-          old = 'CHECK_CXX_COMPILER_FLAG(-march=armv8-a+crypto XMRIG_ARM_CRYPTO)'
-          new = 'set(XMRIG_ARM_CRYPTO OFF)'
-
-          count = text.count(old)
-
-          if count != 1:
-              raise SystemExit(f'ARM crypto check replacement failed: expected 1 match, found {count}')
-
-          cpu_cmake.write_text(text.replace(old, new, 1))
-          PY
+          if ! grep -q 'set(XMRIG_ARM_CRYPTO OFF)' "$BASE/cmake/cpu.cmake"; then
+            echo "Baseline ARM build patch failed."
+            exit 1
+          fi
 
           build_xmrig \
             "$BASE" \
@@ -283,12 +169,36 @@ jobs:
           set -eu
 
           DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+          VARIANT="${XMRIG_ARM_VARIANT:-auto}"
 
-          if grep -Eiq '^[[:space:]]*[Ff]eatures[[:space:]]*:.*(^|[[:space:]])aes([[:space:]]|$)' /proc/cpuinfo 2>/dev/null; then
-            exec "$DIR/xmrig-aarch64-crypto" "$@"
-          fi
+          case "$VARIANT" in
+            crypto)
+              exec "$DIR/xmrig-aarch64-crypto" "$@"
+              ;;
+            baseline)
+              exec "$DIR/xmrig-aarch64-baseline" "$@"
+              ;;
+            auto)
+              if awk '
+                /^[Ff]eatures/ && $0 ~ /(^|[[:space:]])aes([[:space:]]|$)/ {
+                  found=1
+                }
+                END {
+                  exit !found
+                }
+              ' /proc/cpuinfo 2>/dev/null
+              then
+                exec "$DIR/xmrig-aarch64-crypto" "$@"
+              fi
 
-          exec "$DIR/xmrig-aarch64-baseline" "$@"
+              exec "$DIR/xmrig-aarch64-baseline" "$@"
+              ;;
+            *)
+              echo "Invalid XMRIG_ARM_VARIANT: $VARIANT"
+              echo "Allowed values: auto, crypto, baseline"
+              exit 2
+              ;;
+          esac
           EOF
 
           cat > "$OUT/runtime/verify.sh" <<'EOF'
@@ -302,12 +212,12 @@ jobs:
 
             if strings "./$BIN" | grep -Eqi 'donate\.v2\.xmrig\.com|donate\.ssl\.xmrig\.com|dev donate started|dev donate finished'
             then
-              echo "Donation-related string found in $BIN"
+              echo "Donation runtime string found in $BIN"
               exit 1
             fi
           done
 
-          echo "Verification passed: static binaries run and no donation runtime strings were found."
+          echo "Verification passed."
           EOF
 
           cat > "$OUT/runtime/config.json.example" <<'EOF'
@@ -348,11 +258,13 @@ jobs:
 
           for BIN in "$OUT/runtime/xmrig-aarch64-baseline" "$OUT/runtime/xmrig-aarch64-crypto"
           do
-            file "$BIN" | grep -qi "statically linked"
+            if ! file "$BIN" | grep -qi 'statically linked'; then
+              echo "Binary is not statically linked: $BIN"
+              exit 1
+            fi
 
-            if readelf -d "$BIN" 2>/dev/null | grep -q "NEEDED"
-            then
-              echo "Dynamic library dependency found in $BIN"
+            if readelf -d "$BIN" 2>/dev/null | grep -q 'NEEDED'; then
+              echo "Dynamic dependency found: $BIN"
               exit 1
             fi
 
@@ -360,21 +272,21 @@ jobs:
 
             if strings "$BIN" | grep -Eqi 'donate\.v2\.xmrig\.com|donate\.ssl\.xmrig\.com|dev donate started|dev donate finished'
             then
-              echo "Donation-related runtime string found in $BIN"
+              echo "Donation runtime string found: $BIN"
               exit 1
             fi
           done
 
           cat > "$OUT/BUILD-MANIFEST.txt" <<EOF
-          XMRig tag: v6.26.0
+          XMRig version: v6.26.0
           XMRig source commit: $(git -C "$SRC" rev-parse HEAD)
-          Target: Linux aarch64, musl, static ELF
+          Build target: Linux aarch64, musl, static ELF
           Static dependencies: libuv, hwloc, OpenSSL
           Enabled: RandomX, Argon2, TLS, hwloc, ASM, benchmark, ARMv8
           Disabled: DonateStrategy, HTTP API, MSR, CUDA, OpenCL
-          Output:
-            xmrig-aarch64-baseline = ARMv8 general compatibility
-            xmrig-aarch64-crypto   = ARMv8 AES/crypto-extension optimized
+          Binaries:
+            xmrig-aarch64-baseline = ARMv8 generic compatibility
+            xmrig-aarch64-crypto   = ARMv8 with AES/crypto extensions
           EOF
 
           cd "$OUT"
